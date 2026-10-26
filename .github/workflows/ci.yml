@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, types, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  supabase:
+    name: Integration + stdio tests against the local Supabase stack
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: supabase/setup-cli@v3
+        with:
+          version: 2.122.0
+      - name: Start Supabase Postgres (applies supabase/migrations and seed.sql)
+        run: supabase db start
+      - run: npm ci
+      - run: npm run build
+      - name: Integration tests (RLS, validation, opt-in tools)
+        run: npm run test:integration
+      - name: stdio end-to-end tests (built server as a child process)
+        run: npm run test:e2e
+      - name: MCP Inspector CLI smoke test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          set -euo pipefail
+          npx -y @modelcontextprotocol/inspector@2.12.0 --cli -e DATABASE_URL="$DATABASE_URL" \
+            --method tools/list -- node dist/src/index.js > tools.json
+          test "$(jq '.tools | length' tools.json)" -eq 5
+          npx -y @modelcontextprotocol/inspector@2.12.0 --cli -e DATABASE_URL="$DATABASE_URL" \
+            --method tools/call --tool-name count_rows --tool-arg table=projects -- node dist/src/index.js > count.json
+          # anon sees exactly one public project in the seed data
+          test "$(jq '.structuredContent.count' count.json)" -eq 1
+      - name: Check out mcp-conformance-tests (pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: mustafaautomation/mcp-conformance-tests
+          ref: fab76581c406addcdfade4137d2b60446bfc88ba
+          path: .conformance
+      - name: Protocol conformance run
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          cd .conformance && npm ci && npm run build && cd ..
+          node .conformance/dist/src/conformance/cli.js --call whoami --args '{}' --timeout 15000 \
+            --json conformance.json -- node dist/src/index.js
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-report
+          path: conformance.json
+          if-no-files-found: ignore
+
+  plain-postgres:
+    name: Integration tests against plain Postgres 17 (no Supabase)
+    needs: checks
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:integration
+      - run: npm run test:e2e
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks 8.30.1
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks version
+      - name: Scan full git history
+        run: ./gitleaks git --redact --verbose --exit-code 1 .

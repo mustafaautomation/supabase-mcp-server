@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: monthly }
+    groups:
+      npm: { patterns: ["*"] }
+    ignore:
+      # typescript-eslint 8.x supports TypeScript < 6.1
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # @types/node tracks the Node 24 runtime (.nvmrc)
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: monthly }
